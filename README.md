@@ -39,7 +39,7 @@
 
 1.  **作業ディレクトリの準備**
     変換処理の拠点となるディレクトリを決定します（例: `C:\ExcelConversion`）。このディレクトリは、スクリプト初回実行時に自動で作成されるため、手動で作成する必要はありません。
-    
+
     **注意**: `-BasePath` パラメータを指定しない場合、スクリプト実行時のカレントディレクトリが作業ディレクトリとして使用されます。
 
 2.  **変換したいExcelファイルの配置**
@@ -96,6 +96,83 @@ C:\ExcelConversion
       * 処理中だったExcelファイルが `failed` フォルダに移動します。
       * エラー内容が `logs` フォルダ内のログファイルに記録されます。
 
+## 自動監視機能 (Auto Monitoring Feature)
+
+### 概要
+
+`unprocessed`フォルダにファイルが追加されたことを自動検知し、`Convert-ExcelToPdf.ps1`を自動実行するWindowsサービス機能を提供します。
+
+### ファイル構成
+
+```
+excel-to-pdf-by-acrobat/
+├── Convert-ExcelToPdf.ps1      # 既存の変換スクリプト
+├── WatchFolder.ps1             # ファイル監視サービス
+├── Install-Watcher.ps1         # インストールスクリプト
+├── Uninstall-Watcher.ps1       # アンインストールスクリプト
+├── config.json                 # 設定ファイル
+└── README.md                   # このファイル
+```
+
+### インストール手順
+
+1. **管理者権限でPowerShellを開く**
+   ```powershell
+   # 管理者としてPowerShellを起動
+   ```
+
+2. **設定ファイルの編集**
+   `config.json`は相対パスで設定されているため、そのまま使用できます：
+   ```json
+   {
+     "ServiceName": "ExcelToPdfWatcher",
+     "WatchPath": "unprocessed",
+     "ScriptPath": "Convert-ExcelToPdf.ps1",
+     "LogPath": "logs",
+     "FileFilters": ["*.xlsx", "*.xls"]
+   }
+   ```
+
+   **注意**: パスはスクリプトと同じディレクトリを基準とした相対パスで指定されています。別の場所に配置したい場合は、絶対パスで指定することも可能です。
+
+3. **サービスのインストール**
+   ```powershell
+   .\Install-Watcher.ps1
+   ```
+
+### 使用方法
+
+- **手動実行**: `unprocessed`フォルダにExcelファイルを配置するだけ
+- **サービス管理**:
+  ```powershell
+  # サービス開始
+  Start-Service -Name "ExcelToPdfWatcher"
+
+  # サービス停止
+  Stop-Service -Name "ExcelToPdfWatcher"
+
+  # サービス状態確認
+  Get-Service -Name "ExcelToPdfWatcher"
+  ```
+
+### アンインストール
+
+```powershell
+# サービスを停止・削除
+.\Uninstall-Watcher.ps1
+
+# ログファイルも保持したい場合
+.\Uninstall-Watcher.ps1 -KeepLogs
+```
+
+### 特徴
+
+- ✅ **リアルタイム監視**: ファイル追加を即座に検知
+- ✅ **自動実行**: 手動でのスクリプト実行が不要
+- ✅ **簡単管理**: ワンコマンドでインストール・アンインストール
+- ✅ **詳細ログ**: 監視・実行状況を詳細に記録
+- ✅ **エラーハンドリング**: 既存サービスの自動停止・再登録
+
 ## トラブルシューティング (Troubleshooting)
 
   * **エラー: `New-Object : COM コンポーネントのクラス ファクトリを取得中に、次のエラーが発生しました:...`**
@@ -112,3 +189,12 @@ C:\ExcelConversion
 
       * **原因**: PowerShellの実行ポリシーが `Restricted` になっている可能性があります。
       * **対策**: [セットアップ](https://www.google.com/search?q=%23%E3%82%BB%E3%83%83%E3%83%88%E3%82%A2%E3%83%83%E3%83%97) の手順に従い、実行ポリシーを変更してください。
+
+  * **自動監視サービスが動作しない**
+
+      * **原因**: 管理者権限でインストールされていない、または設定ファイルのパスが正しくない可能性があります。
+      * **対策**:
+        1. 管理者権限でPowerShellを開き直す
+        2. `config.json`のパス設定を確認する
+        3. `.\Uninstall-Watcher.ps1`でアンインストール後、`.\Install-Watcher.ps1`で再インストールする
+        4. `logs`フォルダ内の`watcher-*.log`ファイルでエラー詳細を確認する
