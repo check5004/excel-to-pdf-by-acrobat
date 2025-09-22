@@ -30,6 +30,14 @@
       * **Microsoft Excel**（2016以降推奨）— 各シートのPDF化にExcelのExportAsFixedFormatを使用します（必須）。
       * *無料のAcrobat Readerでは動作しません。*
 
+### Acrobatの要件（重要）
+
+- **有償版が必須**: Adobe AcrobatのCOM自動化（`AcroExch` など）は、Acrobat Pro/Standardなどの有償版にのみ含まれます。無料のAdobe Acrobat Readerは非対応です。
+- **COMコンポーネント単体の提供なし**: COMコンポーネントのみを個別にインストールすることはできません。必ずライセンス認証済みのAcrobat本体をインストールしてください。
+- **対象バージョンの例**: Acrobat Pro DC、Acrobat Standard DC、Acrobat（サブスクリプション版）など。いずれもライセンス認証が必要です。
+- **公式情報**: 詳細はAdobe公式ヘルプをご参照ください（`https://helpx.adobe.com/jp/acrobat/kb/cq04060649.html`）。
+- **動作の前提**: 本スクリプトはExcelで一時PDFを作成後、AcrobatのCOM経由で開いて最終保存します。そのため、Acrobatが正常に起動・ライセンス認証済みであること、およびCOM登録が正しく行われていることが前提です。
+
 ## セットアップ (Setup)
 
 1.  **スクリプトの配置**
