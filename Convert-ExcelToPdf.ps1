@@ -26,6 +26,45 @@ param (
     [string]$BasePath = $PWD
 )
 
+# --- 設定ファイルの読み込み（UseAcrobatフラグ対応） ---
+function Read-ProjectConfig {
+    try {
+        $configPath = Join-Path -Path $PSScriptRoot -ChildPath "config.json"
+        if (-not (Test-Path -Path $configPath -PathType Leaf)) { return @{ UseAcrobat = $true } }
+        $json = Get-Content -Path $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $useAcrobat = $true
+        if ($json.PSObject.Properties.Name -contains 'UseAcrobat') { $useAcrobat = [bool]$json.UseAcrobat }
+        return @{ UseAcrobat = $useAcrobat; ConfigPath = $configPath; Raw = $json }
+    }
+    catch {
+        return @{ UseAcrobat = $true }
+    }
+}
+
+function Update-ProjectConfigUseAcrobatFalse {
+    param(
+        [string]$ConfigPath,
+        [object]$Raw
+    )
+    try {
+        if (-not $ConfigPath) { return }
+        if (-not $Raw) {
+            $Raw = @{}
+        }
+        $Raw.UseAcrobat = $false
+        $Raw.LastUpdated = (Get-Date -Format 'yyyy-MM-dd')
+        ($Raw | ConvertTo-Json -Depth 5) | Set-Content -Path $ConfigPath -Encoding UTF8
+        Write-Log -Message "config.jsonのUseAcrobatをfalseに更新しました（自動フォールバック）"
+    }
+    catch {
+        Write-Log -Message "config.jsonの更新に失敗しました: $($_.Exception.Message)" -LogLevel "WARN"
+    }
+}
+
+# 設定のロード
+$projectConfig = Read-ProjectConfig
+$useAcrobatMode = $projectConfig.UseAcrobat
+
 # --- 関数定義: ログ出力 ---
 function Write-Log {
     param (
@@ -181,34 +220,41 @@ foreach ($file in $excelFiles) {
             throw "Excelでブックを開けません: $($_.Exception.Message)"
         }
 
-        # Acrobat 既存プロセスの停止（安定化）
-        try {
-            $existingAcrobat = Get-Process -Name "Acrobat" -ErrorAction SilentlyContinue
-            if ($existingAcrobat) {
-                Write-Log -Message "既存のAcrobatプロセスを終了します: $($existingAcrobat.Count)個"
-                $existingAcrobat | Stop-Process -Force -ErrorAction SilentlyContinue
-                Start-Sleep -Seconds 2
-            }
-        }
-        catch {
-            Write-Log -Message "既存プロセスの確認中にエラー: $($_.Exception.Message)" -LogLevel "WARN"
-        }
-
-        # Acrobat COMオブジェクト（1回生成して使い回し）
-        $maxRetries = 3
-        $retryCount = 0
-        $comObjectsCreated = $false
-        while (-not $comObjectsCreated -and $retryCount -lt $maxRetries) {
+        # Acrobat使用モード時のみ、既存プロセス停止とCOM生成を行う
+        if ($useAcrobatMode) {
             try {
-                $acrobatApp = New-Object -ComObject AcroExch.App -ErrorAction Stop
-                $avDoc = New-Object -ComObject AcroExch.AVDoc -ErrorAction Stop
-                $comObjectsCreated = $true
-                Write-Log -Message "Acrobat COMオブジェクトを生成しました（試行回数: $($retryCount + 1)）"
+                $existingAcrobat = Get-Process -Name "Acrobat" -ErrorAction SilentlyContinue
+                if ($existingAcrobat) {
+                    Write-Log -Message "既存のAcrobatプロセスを終了します: $($existingAcrobat.Count)個"
+                    $existingAcrobat | Stop-Process -Force -ErrorAction SilentlyContinue
+                    Start-Sleep -Seconds 2
+                }
             }
             catch {
-                $retryCount++
-                Write-Log -Message "COMオブジェクト生成失敗（試行回数: $retryCount/$maxRetries）: $($_.Exception.Message)" -LogLevel "WARN"
-                if ($retryCount -lt $maxRetries) { Start-Sleep -Seconds 3 } else { throw "COMオブジェクトの生成に失敗しました: $($_.Exception.Message)" }
+                Write-Log -Message "既存プロセスの確認中にエラー: $($_.Exception.Message)" -LogLevel "WARN"
+            }
+
+            # Acrobat COMオブジェクト（1回生成して使い回し）
+            $maxRetries = 3
+            $retryCount = 0
+            $comObjectsCreated = $false
+            while (-not $comObjectsCreated -and $retryCount -lt $maxRetries) {
+                try {
+                    $acrobatApp = New-Object -ComObject AcroExch.App -ErrorAction Stop
+                    $avDoc = New-Object -ComObject AcroExch.AVDoc -ErrorAction Stop
+                    $comObjectsCreated = $true
+                    Write-Log -Message "Acrobat COMオブジェクトを生成しました（試行回数: $($retryCount + 1)）"
+                }
+                catch {
+                    $retryCount++
+                    Write-Log -Message "COMオブジェクト生成失敗（試行回数: $retryCount/$maxRetries）: $($_.Exception.Message)" -LogLevel "WARN"
+                    if ($retryCount -lt $maxRetries) { Start-Sleep -Seconds 3 } else {
+                        Write-Log -Message "Acrobat初期化に失敗したため非Acrobatモードへ自動切替" -LogLevel "ERROR"
+                        $useAcrobatMode = $false
+                        Update-ProjectConfigUseAcrobatFalse -ConfigPath $projectConfig.ConfigPath -Raw $projectConfig.Raw
+                        break
+                    }
+                }
             }
         }
 
@@ -237,26 +283,49 @@ foreach ($file in $excelFiles) {
                 continue
             }
 
-            # 一時PDFをAcrobatで開いて最終保存（Adobe使用要件の担保）
-            try {
-                if ($avDoc.Open($tempPdfPath, "")) {
-                    $pdDoc = $avDoc.GetPDDoc()
-                    $saveSuccess = $pdDoc.Save(1, $finalPdfPath)
-                    if (-not $saveSuccess) { throw "PDFの最終保存に失敗" }
-                    Write-Log -Message "最終PDF保存: $finalPdfPath"
+            if ($useAcrobatMode -and $avDoc) {
+                # 一時PDFをAcrobatで開いて最終保存
+                try {
+                    if ($avDoc.Open($tempPdfPath, "")) {
+                        $pdDoc = $avDoc.GetPDDoc()
+                        $saveSuccess = $pdDoc.Save(1, $finalPdfPath)
+                        if (-not $saveSuccess) { throw "PDFの最終保存に失敗" }
+                        Write-Log -Message "最終PDF保存: $finalPdfPath"
+                    }
+                    else {
+                        throw "Acrobatで一時PDFを開けませんでした: $tempPdfPath"
+                    }
                 }
-                else {
-                    throw "Acrobatで一時PDFを開けませんでした: $tempPdfPath"
+                catch {
+                    Write-Log -Message "Acrobatでの最終保存に失敗: $($_.Exception.Message)" -LogLevel "ERROR"
+                    # ここで自動フォールバック
+                    $useAcrobatMode = $false
+                    Update-ProjectConfigUseAcrobatFalse -ConfigPath $projectConfig.ConfigPath -Raw $projectConfig.Raw
+                    # 非Acrobatモードの保存に切替
+                    try {
+                        Copy-Item -Path $tempPdfPath -Destination $finalPdfPath -Force
+                        Write-Log -Message "非Acrobatモードで最終PDF保存（コピー）: $finalPdfPath"
+                    }
+                    catch {
+                        Write-Log -Message "非Acrobatモード保存にも失敗: $($_.Exception.Message)" -LogLevel "ERROR"
+                    }
                 }
             }
-            catch {
-                Write-Log -Message "Acrobatでの最終保存に失敗: $($_.Exception.Message)" -LogLevel "ERROR"
+            else {
+                # 非Acrobatモード: Excelが出力したPDFをそのまま最終保存パスへ
+                try {
+                    Copy-Item -Path $tempPdfPath -Destination $finalPdfPath -Force
+                    Write-Log -Message "最終PDF保存（非Acrobatモード）: $finalPdfPath"
+                }
+                catch {
+                    Write-Log -Message "非AcrobatモードでのPDF保存に失敗: $($_.Exception.Message)" -LogLevel "ERROR"
+                }
             }
             finally {
                 # 可視状態を元に戻す
                 try { if ($null -ne $originalVisible) { $sheet.Visible = $originalVisible } } catch {}
                 if ($null -ne $pdDoc) { $pdDoc.Close(); [System.Runtime.InteropServices.Marshal]::ReleaseComObject($pdDoc) | Out-Null; $pdDoc = $null }
-                if ($null -ne $avDoc) { $avDoc.Close($true) | Out-Null; [System.Runtime.InteropServices.Marshal]::ReleaseComObject($avDoc) | Out-Null; $avDoc = New-Object -ComObject AcroExch.AVDoc }
+                if ($useAcrobatMode -and $null -ne $avDoc) { $avDoc.Close($true) | Out-Null; [System.Runtime.InteropServices.Marshal]::ReleaseComObject($avDoc) | Out-Null; $avDoc = New-Object -ComObject AcroExch.AVDoc }
                 # 一時PDFを削除
                 try { if (Test-Path -Path $tempPdfPath) { Remove-Item -Path $tempPdfPath -Force } } catch {}
             }
@@ -279,9 +348,11 @@ foreach ($file in $excelFiles) {
         if ($null -ne $excelApp) { try { $excelApp.Quit() } catch {}; [System.Runtime.InteropServices.Marshal]::ReleaseComObject($excelApp) | Out-Null }
 
         # Acrobat COMクリーンアップ
-        if ($null -ne $pdDoc) { try { $pdDoc.Close() } catch {}; [System.Runtime.InteropServices.Marshal]::ReleaseComObject($pdDoc) | Out-Null }
-        if ($null -ne $avDoc) { try { $avDoc.Close($true) } catch {}; [System.Runtime.InteropServices.Marshal]::ReleaseComObject($avDoc) | Out-Null }
-        if ($null -ne $acrobatApp) { try { $acrobatApp.Exit() } catch {}; [System.Runtime.InteropServices.Marshal]::ReleaseComObject($acrobatApp) | Out-Null }
+        if ($useAcrobatMode) {
+            if ($null -ne $pdDoc) { try { $pdDoc.Close() } catch {}; [System.Runtime.InteropServices.Marshal]::ReleaseComObject($pdDoc) | Out-Null }
+            if ($null -ne $avDoc) { try { $avDoc.Close($true) } catch {}; [System.Runtime.InteropServices.Marshal]::ReleaseComObject($avDoc) | Out-Null }
+            if ($null -ne $acrobatApp) { try { $acrobatApp.Exit() } catch {}; [System.Runtime.InteropServices.Marshal]::ReleaseComObject($acrobatApp) | Out-Null }
+        }
 
         # --- Excel解放後のファイル移動（ロック回避のためリトライ） ---
         try {

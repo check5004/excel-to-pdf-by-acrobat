@@ -127,6 +127,13 @@ C:\ExcelConversion
 - これにより、Adobe Acrobatを必ず経由してPDFが生成されるため、要件「Adobeを使うのは必須」を満たします。
 - 既存のAcrobatプロセス終了やCOMリトライ、オブジェクト解放など、安定動作のための対策も実装されています。
 
+### 自動フォールバック（Adobe失敗時の非Acrobatモード）
+
+- `config.json` に `UseAcrobat` フラグ（既定: `true`）を追加しました。
+- Acrobatの初期化（COM生成）や最終保存に失敗した場合、スクリプトは自動で `UseAcrobat` を `false` に書き換え、以降の処理は**非Acrobatモード**に切り替わります。
+- 非Acrobatモードでは、Excelが出力した一時PDFをそのまま最終保存先へコピーします。出力ディレクトリ・ファイル命名はAdobe使用時と同一です（`completed/pdf/<Excel名>/<Excel名>__<シート名>.pdf`）。
+- Acrobat環境が復旧した後に再度Acrobat経由に戻したい場合は、`config.json` の `UseAcrobat` を `true` に戻してください。
+
 ## 自動監視機能 (Auto Monitoring Feature)
 
 ### 概要
