@@ -6,3 +6,4 @@ logs/
 *.pdf
 *.xlsx
 *.xls
+*.backup.*

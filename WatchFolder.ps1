@@ -17,7 +17,10 @@
 
 param (
     [Parameter(Mandatory = $false)]
-    [string]$ConfigPath
+    [string]$ConfigPath,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$BatchMode
 )
 
 # デフォルト値の設定
@@ -101,7 +104,9 @@ function Write-ServiceLog {
 function Invoke-NewFileProcessing {
     param (
         [string]$FilePath,
-        [string]$FileName
+        [string]$FileName,
+        [string]$OverrideScriptPath,
+        [string]$OverrideWatchPath
     )
 
     try {
@@ -127,11 +132,17 @@ function Invoke-NewFileProcessing {
         }
 
         # Convert-ExcelToPdf.ps1を実行
-        Write-ServiceLog "変換スクリプトを実行開始: $($script:config.ScriptPath)"
+        $scriptPathToRun = if ($OverrideScriptPath) { $OverrideScriptPath } else { $script:config.ScriptPath }
+        $watchPathForBase = if ($OverrideWatchPath) { $OverrideWatchPath } else { $script:config.WatchPath }
+        Write-ServiceLog "変換スクリプトを実行開始: $scriptPathToRun"
 
         $processInfo = New-Object System.Diagnostics.ProcessStartInfo
-        $processInfo.FileName = "powershell.exe"
-        $processInfo.Arguments = "-ExecutionPolicy RemoteSigned -File `"$($script:config.ScriptPath)`""
+        # サービス環境でも安定動作するようにPS実行を明示・プロファイル無効化・ポリシー回避
+        $psExe = Join-Path -Path $env:SystemRoot -ChildPath "System32/WindowsPowerShell/v1.0/powershell.exe"
+        $processInfo.FileName = $psExe
+        # Convert スクリプトの BasePath は WatchPath の親ディレクトリに固定
+        $basePath = Split-Path -Path $watchPathForBase -Parent
+        $processInfo.Arguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPathToRun`" -BasePath `"$basePath`""
         $processInfo.UseShellExecute = $false
         $processInfo.RedirectStandardOutput = $true
         $processInfo.RedirectStandardError = $true
@@ -183,29 +194,87 @@ try {
     $watcher.Path = $script:config.WatchPath
     $watcher.Filter = "*.*"
     $watcher.IncludeSubdirectories = $false
-    $watcher.EnableRaisingEvents = $true
+    $watcher.InternalBufferSize = 64KB
+    $watcher.NotifyFilter = [System.IO.NotifyFilters]::FileName -bor [System.IO.NotifyFilters]::LastWrite -bor [System.IO.NotifyFilters]::Size
+    # 先にイベントを登録してから有効化（起動直後の取りこぼし防止）
 
-    # ファイル作成イベントの登録
+    # イベントアクション（Created/Changed/Renamed を処理）
     $action = {
         $path = $Event.SourceEventArgs.FullPath
         $name = $Event.SourceEventArgs.Name
+        $eventName = $Event.SourceEventArgs.ChangeType
+        $filters = $Event.MessageData.Filters
+        $scriptPath = $Event.MessageData.ScriptPath
+        $watchPath = $Event.MessageData.WatchPath
 
-        # ファイル拡張子の確認
-        $fileExtension = [System.IO.Path]::GetExtension($name).ToLower()
-        $targetExtensions = $script:config.FileFilters | ForEach-Object { $_.ToLower().Replace("*", "") }
+        # デバッグ: 受信イベントを必ず記録
+        Write-ServiceLog "イベント受信: $eventName - $name ($path)"
 
-        if ($targetExtensions -contains $fileExtension) {
-            Invoke-NewFileProcessing -FilePath $path -FileName $name
+        # Excelの一時ロックファイル(~$)は無視
+        if ($name -like "~$*") {
+            Write-ServiceLog "ロックファイルをスキップ: $name" -LogLevel "DEBUG"
+            return
+        }
+
+        # ワイルドカードでのパターン一致（*.xlsx, *.xls など）
+        $matched = $false
+        foreach ($pat in $filters) {
+            if ($name -like $pat) { $matched = $true; break }
+        }
+
+        if ($matched) {
+            Invoke-NewFileProcessing -FilePath $path -FileName $name -OverrideScriptPath $scriptPath -OverrideWatchPath $watchPath
+        }
+        else {
+            Write-ServiceLog "対象外パターン: $name (filters: $($filters -join ', '))" -LogLevel "DEBUG"
         }
     }
 
-    Register-ObjectEvent -InputObject $watcher -EventName "Created" -Action $action | Out-Null
+    $msg = @{ Filters = $script:config.FileFilters; ScriptPath = $script:config.ScriptPath; WatchPath = $script:config.WatchPath }
+    Register-ObjectEvent -InputObject $watcher -EventName "Created" -Action $action -MessageData $msg | Out-Null
+    Register-ObjectEvent -InputObject $watcher -EventName "Changed" -Action $action -MessageData $msg | Out-Null
+    Register-ObjectEvent -InputObject $watcher -EventName "Renamed" -Action $action -MessageData $msg | Out-Null
+
+    # バッファオーバーフロー等のエラー監視
+    Register-ObjectEvent -InputObject $watcher -EventName "Error" -Action {
+        try {
+            $ex = $Event.SourceEventArgs.GetException()
+            Write-ServiceLog "監視エラー: $($ex.Message)" -LogLevel "ERROR"
+        }
+        catch {
+            Write-ServiceLog "監視エラー: 詳細不明" -LogLevel "ERROR"
+        }
+    } | Out-Null
+
+    $watcher.EnableRaisingEvents = $true
 
     Write-ServiceLog "ファイル監視を開始しました。監視対象拡張子: $($script:config.FileFilters -join ', ')"
 
+    # 起動時の既存ファイルを初期スキャンして取りこぼしを防止
+    try {
+        $patterns = $script:config.FileFilters
+        $existing = @()
+        foreach ($pat in $patterns) {
+            $existing += Get-ChildItem -Path $script:config.WatchPath -Filter $pat -File -ErrorAction SilentlyContinue
+        }
+        foreach ($f in $existing | Sort-Object FullName -Unique) {
+            Invoke-NewFileProcessing -FilePath $f.FullName -FileName $f.Name
+        }
+    }
+    catch {
+        Write-ServiceLog "初期スキャンでエラー: $($_.Exception.Message)" -LogLevel "WARN"
+    }
+
+    # バッチモードの場合は一度だけ実行して終了
+    if ($BatchMode) {
+        Write-ServiceLog "バッチモードで実行完了。5分後に再実行されます。"
+        return
+    }
+
     # サービスとして動作させるため、無限ループで待機
     while ($true) {
-        Start-Sleep -Seconds 10
+        # イベントキューをポンプしつつ待機
+        Wait-Event -Timeout 10 | Out-Null
     }
 }
 catch {

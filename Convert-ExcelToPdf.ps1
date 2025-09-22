@@ -140,8 +140,42 @@ foreach ($file in $excelFiles) {
         Move-Item -Path $file.FullName -Destination $processingPath -Force
 
         # --- Acrobat COMオブジェクトの生成 ---
-        $acrobatApp = New-Object -ComObject AcroExch.App -ErrorAction Stop
-        $avDoc = New-Object -ComObject AcroExch.AVDoc -ErrorAction Stop
+        # COMエラーの回避: 既存のAcrobatプロセスを確認・終了
+        try {
+            $existingAcrobat = Get-Process -Name "Acrobat" -ErrorAction SilentlyContinue
+            if ($existingAcrobat) {
+                Write-Log -Message "既存のAcrobatプロセスを終了します: $($existingAcrobat.Count)個"
+                $existingAcrobat | Stop-Process -Force -ErrorAction SilentlyContinue
+                Start-Sleep -Seconds 2
+            }
+        }
+        catch {
+            Write-Log -Message "既存プロセスの確認中にエラー: $($_.Exception.Message)" -LogLevel "WARN"
+        }
+
+        # COMオブジェクトの生成（リトライ機能付き）
+        $maxRetries = 3
+        $retryCount = 0
+        $comObjectsCreated = $false
+
+        while (-not $comObjectsCreated -and $retryCount -lt $maxRetries) {
+            try {
+                $acrobatApp = New-Object -ComObject AcroExch.App -ErrorAction Stop
+                $avDoc = New-Object -ComObject AcroExch.AVDoc -ErrorAction Stop
+                $comObjectsCreated = $true
+                Write-Log -Message "Acrobat COMオブジェクトを生成しました（試行回数: $($retryCount + 1)）"
+            }
+            catch {
+                $retryCount++
+                Write-Log -Message "COMオブジェクト生成失敗（試行回数: $retryCount/$maxRetries）: $($_.Exception.Message)" -LogLevel "WARN"
+                if ($retryCount -lt $maxRetries) {
+                    Start-Sleep -Seconds 3
+                }
+                else {
+                    throw "COMオブジェクトの生成に失敗しました: $($_.Exception.Message)"
+                }
+            }
+        }
 
         # --- PDF変換実行 ---
         if ($avDoc.Open($processingPath, "")) {

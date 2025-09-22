@@ -200,6 +200,27 @@ function Remove-ServiceIfExists {
     }
 }
 
+# --- タスクスケジューラの削除 ---
+function Unregister-WatcherScheduledTask {
+    param ([string]$TaskName)
+
+    try {
+        $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        if ($task) {
+            Write-UninstallLog "タスクを削除中: $TaskName"
+            try { Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue } catch {}
+            Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+            Write-UninstallLog "タスクを削除しました: $TaskName"
+        }
+        else {
+            Write-UninstallLog "削除対象のタスクが見つかりません: $TaskName"
+        }
+    }
+    catch {
+        Write-UninstallLog "タスクの削除に失敗しました: $($_.Exception.Message)" -LogLevel "WARN"
+    }
+}
+
 # --- ログファイルのクリーンアップ ---
 function Remove-LogFiles {
     param (
@@ -234,22 +255,6 @@ function Remove-LogFiles {
     }
 }
 
-# --- 設定ファイルのバックアップ ---
-function Backup-ConfigFile {
-    param ([string]$ConfigPath)
-
-    try {
-        if (Test-Path -Path $ConfigPath -PathType Leaf) {
-            $backupPath = $ConfigPath + ".backup." + (Get-Date -Format "yyyyMMdd-HHmmss")
-            Copy-Item -Path $ConfigPath -Destination $backupPath
-            Write-UninstallLog "設定ファイルをバックアップしました: $backupPath"
-        }
-    }
-    catch {
-        Write-UninstallLog "設定ファイルのバックアップに失敗しました: $($_.Exception.Message)" -LogLevel "WARN"
-    }
-}
-
 # --- メイン処理 ---
 try {
     Write-UninstallLog "===== ファイル監視サービス アンインストール開始 ====="
@@ -269,23 +274,16 @@ try {
 
     Write-UninstallLog "対象サービス: $serviceName"
 
-    # サービスの存在確認
-    if (-not (Test-ServiceExists -ServiceName $serviceName)) {
-        Write-UninstallLog "対象のサービスが見つかりません: $serviceName"
-        Write-UninstallLog "アンインストール対象がありません。"
-        exit 0
+    # サービスの停止/削除（存在すれば）
+    if (Test-ServiceExists -ServiceName $serviceName) {
+        Stop-ServiceIfExists -ServiceName $serviceName
+        Remove-ServiceIfExists -ServiceName $serviceName
     }
 
-    # 設定ファイルのバックアップ
-    if ($config) {
-        Backup-ConfigFile -ConfigPath $ConfigPath
-    }
-
-    # サービスの停止
-    Stop-ServiceIfExists -ServiceName $serviceName
-
-    # サービスの削除
-    Remove-ServiceIfExists -ServiceName $serviceName
+    # タスクスケジューラの削除（フォールバック/レガシー名）
+    Unregister-WatcherScheduledTask -TaskName $serviceName
+    # リアルタイム常駐タスク名の削除
+    Unregister-WatcherScheduledTask -TaskName "$serviceName-RealTime"
 
     # ログファイルのクリーンアップ
     if ($config) {
