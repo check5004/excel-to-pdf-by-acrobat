@@ -4,6 +4,7 @@
   "ScriptPath": "Convert-ExcelToPdf.ps1",
   "LogPath": "logs",
   "FileFilters": ["*.xlsx", "*.xls"],
+  "UseAcrobat": true,
   "Description": "Excel to PDF変換のファイル監視サービス設定",
   "Version": "1.0.0",
   "LastUpdated": "2025-01-22"
