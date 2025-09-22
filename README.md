@@ -19,12 +19,15 @@
   * **初期スキャン**: 監視開始時に `unprocessed` の既存ファイルも自動で取りこぼしなく処理します。
   * **書き込み完了待ち**: 追加直後のファイルは最大30秒の書き込み完了待機で安定処理します。
   * **ディレクトリ説明ファイル**: 各フォルダに説明用の空ファイルを自動生成し、用途を明示します。
+  * **全シート個別PDF出力（新機能）**: 各Excelブック内の全ワークシートを個別のPDFに出力し、ファイル名にシート名を含めます。出力はブック単位の専用ディレクトリに格納されます。
 
 ## 動作環境 (Prerequisites)
 
   * **OS**: Windows 10 / Windows 11 / Windows Server
   * **PowerShell**: 5.1以上 (Windows 10/11に標準搭載)
-  * **必須ソフトウェア**: **Adobe Acrobat Pro DC** （または同等のCOMコンポーネントを持つバージョン）がインストールされ、ライセンス認証済みであること。
+  * **必須ソフトウェア**:
+      * **Adobe Acrobat Pro DC** （または同等のCOMコンポーネントを持つバージョン）— ライセンス認証済みであること（必須）。
+      * **Microsoft Excel**（2016以降推奨）— 各シートのPDF化にExcelのExportAsFixedFormatを使用します（必須）。
       * *無料のAcrobat Readerでは動作しません。*
 
 ## セットアップ (Setup)
@@ -86,9 +89,17 @@ C:\ExcelConversion
 ├── 📂 completed       <-- ③ 変換成功後、ファイルがここに格納される
 │   ├── 📂 excel       <--    元のExcelファイルがここに移動
 │   └── 📂 pdf         <--    変換されたPDFファイルがここに保存
+│       └── 📂 <Excelファイル名>   <-- 各ブック専用ディレクトリ（新仕様）
 ├── 📂 failed          <-- ④ 変換に失敗したExcelファイルがここに移動
 └── 📂 logs            <-- ⑤ 実行ログが日付ごとのファイルで保存される
 ```
+
+### 新しいPDF出力仕様（全シート個別）
+
+- **出力単位**: ブック内の各ワークシートを個別のPDFとして出力
+- **出力先**: `completed/pdf/<Excelファイル名>/`
+- **ファイル名**: `<Excelファイル名>__<シート名>.pdf`
+- **ファイル名サニタイズ**: Windowsで使用できない文字は自動で`_`に置換。長すぎる名前は適宜カット。重複するシート名には`_2`, `_3`…を付与。
 
 ### 処理フロー
 
@@ -96,11 +107,17 @@ C:\ExcelConversion
 2.  スクリプトが実行されると、`unprocessed` フォルダ内のファイルを検知します。
 3.  ファイルは `processing` フォルダに移動され、PDFへの変換処理が開始されます。
 4.  **成功した場合**:
-      * 生成されたPDFファイルが `completed/pdf` に保存されます。
+      * 各シートごとのPDFが `completed/pdf/<Excelファイル名>/` に保存されます（新仕様）。
       * 元のExcelファイルが `completed/excel` に移動します。
 5.  **失敗した場合**:
       * 処理中だったExcelファイルが `failed` フォルダに移動します。
       * エラー内容が `logs` フォルダ内のログファイルに記録されます。
+
+## Adobe使用要件と内部処理
+
+- 本スクリプトは、各シートを一時PDFとして出力（ExcelのExportAsFixedFormatを使用）した後、**Adobe Acrobat COM（AcroExch）で開いて最終保存**します。
+- これにより、Adobe Acrobatを必ず経由してPDFが生成されるため、要件「Adobeを使うのは必須」を満たします。
+- 既存のAcrobatプロセス終了やCOMリトライ、オブジェクト解放など、安定動作のための対策も実装されています。
 
 ## 自動監視機能 (Auto Monitoring Feature)
 
@@ -194,27 +211,38 @@ excel-to-pdf-by-acrobat/
   Get-Content .\logs\uninstall-$(Get-Date -Format 'yyyy-MM-dd').log -Tail 100
   ```
 
-### アンインストール（サービスとタスクの両方をクリーンに削除）
+## アーキテクチャ（監視・変換フロー）
 
-```powershell
-# サービスを停止・削除
-.\Uninstall-Watcher.ps1
+```mermaid
+flowchart TD
+    U[ユーザーがExcel配置\nunprocessed] -->|Created/Changed/Renamed| W(WatchFolder.ps1)
+    W -->|リアルタイム/初期スキャン| C[Convert-ExcelToPdf.ps1]
+    C -->|成功| P[completed/pdf/<Excel名>/<Excel名>__<シート名>.pdf]
+    C -->|成功| E[completed/excel]
+    C -->|失敗| F[failed]
 
-# ログファイルも保持したい場合
-.\Uninstall-Watcher.ps1 -KeepLogs
+    subgraph 実行形態
+        RT[タスクスケジューラ<br/>リアルタイム常駐] -.->|失敗時自動切替| Batch[タスクスケジューラ<br/>5分バッチ]
+        Svc[Windowsサービス<br/>（任意/互換）]
+    end
+
+    RT -.->|継続監視| W
+    Batch -.->|定期実行| W
+    Svc -.->|継続監視| W
+
+    subgraph エラー対策
+        COM[COMエラー対策<br/>既存プロセス終了<br/>リトライ機能]
+    end
+
+    C -.->|Adobe Acrobat| COM
 ```
 
-### 特徴
+## 補足（シート名とファイル名の扱い）
 
-- ✅ **リアルタイム監視**: ファイル追加を即座に検知（Windowsサービス）
-- ✅ **自動実行**: 手動でのスクリプト実行が不要
-- ✅ **フォルダ監視優先**: Windowsサービスによる継続的なフォルダ監視を基本とする
-- ✅ **フォールバック機能**: サービス起動不可時はタスクスケジューラ（5分ごと）に自動切替
-- ✅ **簡単管理**: ワンコマンドでインストール・アンインストール
-- ✅ **詳細ログ**: 監視・実行状況を詳細に記録
-- ✅ **エラーハンドリング**: 既存サービスの自動停止・再登録
-- ✅ **初期スキャン**: ウォッチャー起動時に既存ファイルも取りこぼしなく処理
-- ✅ **COMエラー対策**: Adobe AcrobatのCOMエラーを回避するリトライ機能
+- Windowsで使用できない文字（`<>:"/\\|?*` など）は自動的に`_`へ置換します。
+- 空名・空白のみの名前は `Sheet` に置換します。
+- 同名シートがある場合は `_2`, `_3` ... といった連番を付与します。
+- 非ASCIIや非常に長いシート名は適宜トリミングされます（約120文字を上限）。
 
 ## トラブルシューティング (Troubleshooting)
 
@@ -239,7 +267,7 @@ excel-to-pdf-by-acrobat/
       * **対策**:
         1. 管理者権限でPowerShellを開き直す
         2. `config.json`のパス設定を確認する
-        3. `.\Uninstall-Watcher.ps1`でアンインストール後、`.\Install-Watcher.ps1`で再インストールする
+        3. ` .\Uninstall-Watcher.ps1`でアンインストール後、` .\Install-Watcher.ps1`で再インストールする
         4. `logs`フォルダ内の`watcher-*.log`ファイルでエラー詳細を確認する
         5. リアルタイムタスクが停止でも、5分バッチが稼働していれば監視は継続します（`Get-ScheduledTask -TaskName "ExcelToPdfWatcher"`）。
 
@@ -247,6 +275,7 @@ excel-to-pdf-by-acrobat/
 
       * **原因**: Adobe AcrobatのCOMオブジェクトがSYSTEMアカウントで実行できない場合があります。
       * **対策**: 本プロジェクトは自動でタスクスケジューラ（リアルタイム→5分バッチ）にフォールバックします。サービス運用時はアカウントを現在のユーザーに設定すると回避できる場合があります。
+
   * **ファイルが追加された直後に変換されない/失敗する**
 
       * **原因**: ネットワーク経由や大容量で書き込みが長引く場合、ロック解除前に処理すると失敗します。
@@ -259,41 +288,3 @@ excel-to-pdf-by-acrobat/
         1. サービス状態を確認: `Get-Service -Name "ExcelToPdfWatcher"`
         2. タスクスケジューラ状態を確認: `schtasks /Query /TN "ExcelToPdfWatcher"`
         3. ログファイルでエラー詳細を確認: `Get-Content .\logs\watcher-$(Get-Date -Format 'yyyy-MM-dd').log -Tail 50`
-
-## アーキテクチャ（監視・変換フロー）
-
-```mermaid
-flowchart TD
-    U[ユーザーがExcel配置\nunprocessed] -->|Created/Changed/Renamed| W(WatchFolder.ps1)
-    W -->|リアルタイム/初期スキャン| C[Convert-ExcelToPdf.ps1]
-    C -->|成功| P[completed/pdf]
-    C -->|成功| E[completed/excel]
-    C -->|失敗| F[failed]
-
-    subgraph 実行形態
-        RT[タスクスケジューラ<br/>リアルタイム常駐] -.->|失敗時自動切替| Batch[タスクスケジューラ<br/>5分バッチ]
-        Svc[Windowsサービス<br/>（任意/互換）]
-    end
-
-    RT -.->|継続監視| W
-    Batch -.->|定期実行| W
-    Svc -.->|継続監視| W
-
-    subgraph エラー対策
-        COM[COMエラー対策<br/>既存プロセス終了<br/>リトライ機能]
-    end
-
-    C -.->|Adobe Acrobat| COM
-```
-
-### 動作の優先順位
-
-1. **Windowsサービス**（推奨）
-   - フォルダ監視によるリアルタイム自動実行
-   - ファイル追加を即座に検知して変換処理を実行
-   - 継続的に動作
-
-2. **タスクスケジューラ**（フォールバック）
-   - 5分ごとのチェック実行
-   - サービス起動できない環境での保険
-   - バッチモードで一度だけ実行して終了

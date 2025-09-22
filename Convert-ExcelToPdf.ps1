@@ -124,11 +124,35 @@ if ($null -eq $excelFiles) {
 Write-Log -Message "$($excelFiles.Count)件のファイルが見つかりました。処理を開始します。"
 
 # --- 3. ファイルごとの変換処理ループ ---
+function Get-SafeFileName {
+    param([string]$Name)
+    # 禁止文字を置換、先頭末尾のピリオド/スペースをトリム、長すぎる場合はカット
+    $sanitized = ($Name -replace '[\\/:*?"<>|]', "_")
+    $sanitized = $sanitized.Trim().Trim('.')
+    if ([string]::IsNullOrWhiteSpace($sanitized)) { $sanitized = "Sheet" }
+    if ($sanitized.Length -gt 120) { $sanitized = $sanitized.Substring(0,120) }
+    return $sanitized
+}
+
 foreach ($file in $excelFiles) {
     $processingPath = Join-Path -Path $processingDirPath -ChildPath $file.Name
-    $pdfPath = Join-Path -Path $completedPdfPath -ChildPath "$($file.BaseName).pdf"
+
+    # 出力ディレクトリ: completed/pdf/<ExcelBaseName>/
+    $excelBaseName = $file.BaseName
+    $excelOutputDir = Join-Path -Path $completedPdfPath -ChildPath (Get-SafeFileName -Name $excelBaseName)
+    if (-not (Test-Path -Path $excelOutputDir -PathType Container)) {
+        New-Item -Path $excelOutputDir -ItemType Directory -Force | Out-Null
+    }
+
+    # 一時ディレクトリ: processing/<ExcelBaseName>/_temp_pdf
+    $tempPdfDir = Join-Path -Path $processingDirPath -ChildPath ((Get-SafeFileName -Name $excelBaseName) + "_temp_pdf")
+    if (-not (Test-Path -Path $tempPdfDir -PathType Container)) {
+        New-Item -Path $tempPdfDir -ItemType Directory -Force | Out-Null
+    }
 
     # COMオブジェクト変数を初期化
+    $excelApp = $null
+    $workbook = $null
     $acrobatApp = $null
     $avDoc = $null
     $pdDoc = $null
@@ -139,8 +163,25 @@ foreach ($file in $excelFiles) {
         # ファイルを作業中ディレクトリへ移動
         Move-Item -Path $file.FullName -Destination $processingPath -Force
 
-        # --- Acrobat COMオブジェクトの生成 ---
-        # COMエラーの回避: 既存のAcrobatプロセスを確認・終了
+        # Excel COMの起動
+        try {
+            $excelApp = New-Object -ComObject Excel.Application -ErrorAction Stop
+            $excelApp.Visible = $false
+            $excelApp.DisplayAlerts = $false
+        }
+        catch {
+            throw "Excel COMの初期化に失敗しました: $($_.Exception.Message)"
+        }
+
+        # ブックを開く
+        try {
+            $workbook = $excelApp.Workbooks.Open($processingPath)
+        }
+        catch {
+            throw "Excelでブックを開けません: $($_.Exception.Message)"
+        }
+
+        # Acrobat 既存プロセスの停止（安定化）
         try {
             $existingAcrobat = Get-Process -Name "Acrobat" -ErrorAction SilentlyContinue
             if ($existingAcrobat) {
@@ -153,11 +194,10 @@ foreach ($file in $excelFiles) {
             Write-Log -Message "既存プロセスの確認中にエラー: $($_.Exception.Message)" -LogLevel "WARN"
         }
 
-        # COMオブジェクトの生成（リトライ機能付き）
+        # Acrobat COMオブジェクト（1回生成して使い回し）
         $maxRetries = 3
         $retryCount = 0
         $comObjectsCreated = $false
-
         while (-not $comObjectsCreated -and $retryCount -lt $maxRetries) {
             try {
                 $acrobatApp = New-Object -ComObject AcroExch.App -ErrorAction Stop
@@ -168,33 +208,58 @@ foreach ($file in $excelFiles) {
             catch {
                 $retryCount++
                 Write-Log -Message "COMオブジェクト生成失敗（試行回数: $retryCount/$maxRetries）: $($_.Exception.Message)" -LogLevel "WARN"
-                if ($retryCount -lt $maxRetries) {
-                    Start-Sleep -Seconds 3
+                if ($retryCount -lt $maxRetries) { Start-Sleep -Seconds 3 } else { throw "COMオブジェクトの生成に失敗しました: $($_.Exception.Message)" }
+            }
+        }
+
+        # 全ワークシートを個別PDFにエクスポート
+        $sheetNameCount = @{}
+        for ($i = 1; $i -le $workbook.Worksheets.Count; $i++) {
+            $sheet = $workbook.Worksheets.Item($i)
+            $rawName = [string]$sheet.Name
+            $safeSheet = Get-SafeFileName -Name $rawName
+            if ($sheetNameCount.ContainsKey($safeSheet)) { $sheetNameCount[$safeSheet]++ } else { $sheetNameCount[$safeSheet] = 1 }
+            $suffix = if ($sheetNameCount[$safeSheet] -gt 1) { "_" + $sheetNameCount[$safeSheet] } else { "" }
+
+            $tempPdfPath = Join-Path -Path $tempPdfDir -ChildPath ("$($safeSheet)$suffix.pdf")
+            $finalPdfPath = Join-Path -Path $excelOutputDir -ChildPath ("$((Get-SafeFileName -Name $excelBaseName))__${safeSheet}${suffix}.pdf")
+
+            try {
+                # シートを可視化して安定して出力（VeryHidden対策）
+                $originalVisible = $sheet.Visible
+                if ($originalVisible -ne -1) { $sheet.Visible = -1 }
+                $xlFixedFormatType = 0 # xlTypePDF
+                $sheet.ExportAsFixedFormat($xlFixedFormatType, $tempPdfPath)
+                Write-Log -Message "一時PDF出力: $tempPdfPath"
+            }
+            catch {
+                Write-Log -Message "ExcelでのPDF出力に失敗: シート=$rawName, エラー=$($_.Exception.Message)" -LogLevel "WARN"
+                continue
+            }
+
+            # 一時PDFをAcrobatで開いて最終保存（Adobe使用要件の担保）
+            try {
+                if ($avDoc.Open($tempPdfPath, "")) {
+                    $pdDoc = $avDoc.GetPDDoc()
+                    $saveSuccess = $pdDoc.Save(1, $finalPdfPath)
+                    if (-not $saveSuccess) { throw "PDFの最終保存に失敗" }
+                    Write-Log -Message "最終PDF保存: $finalPdfPath"
                 }
                 else {
-                    throw "COMオブジェクトの生成に失敗しました: $($_.Exception.Message)"
+                    throw "Acrobatで一時PDFを開けませんでした: $tempPdfPath"
                 }
             }
-        }
-
-        # --- PDF変換実行 ---
-        if ($avDoc.Open($processingPath, "")) {
-            $pdDoc = $avDoc.GetPDDoc()
-            # Saveメソッドの第一引数 '1' は PDSaveFull (フル保存) を意味する
-            $saveSuccess = $pdDoc.Save(1, $pdfPath)
-            if (-not $saveSuccess) {
-                # SaveメソッドがFalseを返した場合、例外を投げてcatchブロックへ
-                throw "PDFファイルの保存に失敗しました。"
+            catch {
+                Write-Log -Message "Acrobatでの最終保存に失敗: $($_.Exception.Message)" -LogLevel "ERROR"
             }
-            Write-Log -Message "変換成功: $($file.Name) -> $($pdfPath)"
-
-            # --- 正常終了時のファイル移動 ---
-            $finalExcelPath = Join-Path -Path $completedExcelPath -ChildPath $file.Name
-            Move-Item -Path $processingPath -Destination $finalExcelPath -Force
-            Write-Log -Message "ファイル移動完了: $finalExcelPath"
-        }
-        else {
-            throw "AcrobatでExcelファイルを開けませんでした。ファイルが破損しているか、Acrobatが対応していない可能性があります。"
+            finally {
+                # 可視状態を元に戻す
+                try { if ($null -ne $originalVisible) { $sheet.Visible = $originalVisible } } catch {}
+                if ($null -ne $pdDoc) { $pdDoc.Close(); [System.Runtime.InteropServices.Marshal]::ReleaseComObject($pdDoc) | Out-Null; $pdDoc = $null }
+                if ($null -ne $avDoc) { $avDoc.Close($true) | Out-Null; [System.Runtime.InteropServices.Marshal]::ReleaseComObject($avDoc) | Out-Null; $avDoc = New-Object -ComObject AcroExch.AVDoc }
+                # 一時PDFを削除
+                try { if (Test-Path -Path $tempPdfPath) { Remove-Item -Path $tempPdfPath -Force } } catch {}
+            }
         }
     }
     catch {
@@ -202,7 +267,6 @@ foreach ($file in $excelFiles) {
         Write-Log -Message $errorMessage -LogLevel "ERROR"
 
         # --- 異常終了時のファイル移動 ---
-        # 処理中ファイルをfailedディレクトリへ移動
         if (Test-Path -Path $processingPath) {
             $failedPath = Join-Path -Path $failedDirPath -ChildPath $file.Name
             Move-Item -Path $processingPath -Destination $failedPath -Force
@@ -210,21 +274,44 @@ foreach ($file in $excelFiles) {
         }
     }
     finally {
-        # --- COMオブジェクトのクリーンアップ ---
-        # このブロックは成功・失敗に関わらず必ず実行される
-        if ($null -ne $pdDoc) {
-            $pdDoc.Close()
-            [System.Runtime.InteropServices.Marshal]::ReleaseComObject($pdDoc) | Out-Null
+        # Excel COMクリーンアップ
+        if ($null -ne $workbook) { try { $workbook.Close($false) } catch {}; [System.Runtime.InteropServices.Marshal]::ReleaseComObject($workbook) | Out-Null }
+        if ($null -ne $excelApp) { try { $excelApp.Quit() } catch {}; [System.Runtime.InteropServices.Marshal]::ReleaseComObject($excelApp) | Out-Null }
+
+        # Acrobat COMクリーンアップ
+        if ($null -ne $pdDoc) { try { $pdDoc.Close() } catch {}; [System.Runtime.InteropServices.Marshal]::ReleaseComObject($pdDoc) | Out-Null }
+        if ($null -ne $avDoc) { try { $avDoc.Close($true) } catch {}; [System.Runtime.InteropServices.Marshal]::ReleaseComObject($avDoc) | Out-Null }
+        if ($null -ne $acrobatApp) { try { $acrobatApp.Exit() } catch {}; [System.Runtime.InteropServices.Marshal]::ReleaseComObject($acrobatApp) | Out-Null }
+
+        # --- Excel解放後のファイル移動（ロック回避のためリトライ） ---
+        try {
+            $finalExcelPath = Join-Path -Path $completedExcelPath -ChildPath $file.Name
+            $attempt = 0
+            $moved = $false
+            while (-not $moved -and $attempt -lt 3) {
+                try {
+                    if (Test-Path -Path $processingPath) {
+                        Move-Item -Path $processingPath -Destination $finalExcelPath -Force
+                        Write-Log -Message "ファイル移動完了: $finalExcelPath"
+                    }
+                    $moved = $true
+                }
+                catch {
+                    $attempt++
+                    Start-Sleep -Milliseconds 800
+                    if ($attempt -ge 3) {
+                        Write-Log -Message "Excelファイルの移動に失敗しました（processingに残置）: $processingPath - エラー: $($_.Exception.Message)" -LogLevel "WARN"
+                    }
+                }
+            }
         }
-        if ($null -ne $avDoc) {
-            $avDoc.Close($true) # $trueはウィンドウを強制的に閉じる
-            [System.Runtime.InteropServices.Marshal]::ReleaseComObject($avDoc) | Out-Null
+        catch {
+            Write-Log -Message "Excelファイルの移動処理で予期せぬエラー: $($_.Exception.Message)" -LogLevel "WARN"
         }
-        if ($null -ne $acrobatApp) {
-            $acrobatApp.Exit()
-            [System.Runtime.InteropServices.Marshal]::ReleaseComObject($acrobatApp) | Out-Null
-        }
-        # メモリ解放を促す
+
+        # 一時フォルダクリーンアップ
+        try { if (Test-Path -Path $tempPdfDir) { Remove-Item -Path $tempPdfDir -Recurse -Force } } catch {}
+
         [System.GC]::Collect()
         [System.GC]::WaitForPendingFinalizers()
     }
