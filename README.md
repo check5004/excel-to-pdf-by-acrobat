@@ -4,18 +4,21 @@
 
 このプロジェクトは、Adobe Acrobat Proを利用して、指定されたフォルダ内にあるExcelファイルを自動でPDFに変換するPowerShellスクリプト群です。
 
-リアルタイム監視は原則として「Windowsサービス」によるフォルダ監視を基本とし、サービス起動できない環境では「タスクスケジューラ（5分ごと）」へフォールバックして確実に稼働します。堅牢なファイル管理と詳細なログ出力機能により、安定した運用が可能です。
+最新の実行形態は「タスクスケジューラ（リアルタイム常駐/ログオン時）」を優先し、利用できない環境では「タスクスケジューラ（5分ごとバッチ）」へフォールバックします。従来の「Windowsサービス」は任意（レガシー互換）としてサポートされます。堅牢なファイル管理と詳細なログ出力機能により、安定した運用が可能です。
 
 ## 主な機能 (Features)
 
   * **リアルタイム自動変換**: `unprocessed` フォルダに配置されたExcelファイル（`.xlsx`, `.xls`）を即座に検知し、自動でPDFに変換します。
-  * **フォルダ監視による自動実行**: Windowsサービスによる継続的なフォルダ監視を基本とし、ファイル追加を即座に検知して変換処理を実行します。
-  * **フォールバック機能**: サービス起動できない環境では、タスクスケジューラによる5分ごとのチェック実行に自動切替します。
+  * **フォルダ監視による自動実行**: タスクスケジューラのリアルタイム常駐（ログオン時起動）を基本とし、ファイル追加を即座に検知して変換処理を実行します。
+  * **フォールバック機能**: リアルタイム常駐が使えない環境では、タスクスケジューラの5分ごとのチェック実行に自動切替します（インストーラが自動設定）。
   * **堅牢なフォルダ管理**: 処理状況に応じてファイルが自動でフォルダ分け（作業中、完了、失敗）されるため、進捗管理が容易です。
   * **詳細なログ出力**: スクリプトの実行開始から終了、各ファイルの処理成否まで、すべてが日付ごとのログファイルに記録されます。
   * **エラーハンドリング**: 変換に失敗したファイルは `failed` フォルダに隔離され、エラー内容がログに出力されるため、問題の追跡が簡単です。
   * **リソース管理**: 処理完了後にAcrobatのプロセスを確実に終了させ、不要なリソースの残存を防ぎます。
   * **COMエラー対策**: Adobe AcrobatのCOMエラーを回避するため、既存プロセスの確認・終了とリトライ機能を実装しています。
+  * **初期スキャン**: 監視開始時に `unprocessed` の既存ファイルも自動で取りこぼしなく処理します。
+  * **書き込み完了待ち**: 追加直後のファイルは最大30秒の書き込み完了待機で安定処理します。
+  * **ディレクトリ説明ファイル**: 各フォルダに説明用の空ファイルを自動生成し、用途を明示します。
 
 ## 動作環境 (Prerequisites)
 
@@ -103,7 +106,7 @@ C:\ExcelConversion
 
 ### 概要
 
-`unprocessed`フォルダにファイルが追加されたことを自動検知し、`Convert-ExcelToPdf.ps1`を自動実行する常駐機能（サービス or タスク）を提供します。
+`unprocessed`フォルダにファイルが追加されたことを自動検知し、`Convert-ExcelToPdf.ps1`を自動実行する常駐機能（タスク常駐/バッチ、任意でサービス）を提供します。
 
 ### ファイル構成
 
@@ -113,11 +116,12 @@ excel-to-pdf-by-acrobat/
 ├── WatchFolder.ps1             # ファイル監視サービス
 ├── Install-Watcher.ps1         # インストールスクリプト
 ├── Uninstall-Watcher.ps1       # アンインストールスクリプト
+├── Run-Watcher.ps1             # 監視タスクの再起動ヘルパー
 ├── config.json                 # 設定ファイル
 └── README.md                   # このファイル
 ```
 
-### インストール手順（Windowsサービス優先 → タスクスケジューラフォールバック）
+### インストール手順（リアルタイム常駐タスク優先 → 5分バッチにフォールバック）
 
 1. **管理者権限でPowerShellを開く**
    ```powershell
@@ -125,52 +129,69 @@ excel-to-pdf-by-acrobat/
    ```
 
 2. **設定ファイルの編集**
-   `config.json`は相対パスで設定されているため、そのまま使用できます：
+   `config.json`は相対パスで設定されており、スクリプトのディレクトリ基準で解決されます。必要に応じて絶対パスも指定可能です：
    ```json
    {
      "ServiceName": "ExcelToPdfWatcher",
      "WatchPath": "unprocessed",
      "ScriptPath": "Convert-ExcelToPdf.ps1",
      "LogPath": "logs",
-     "FileFilters": ["*.xlsx", "*.xls"]
+     "FileFilters": ["*.xlsx", "*.xls"],
+     "Description": "Excel to PDF変換のファイル監視サービス設定",
+     "Version": "1.0.0",
+     "LastUpdated": "2025-01-22"
    }
    ```
 
+   - `WatchPath`/`ScriptPath`/`LogPath` は相対・絶対どちらでも指定できます（内部で解決）。
+   - `FileFilters` はワイルドカードで複数指定可能です（例: `*.xlsx`, `*.xls`）。
+   - `ServiceName` はタスク/サービス名としても用いられます（リアルタイムは `-RealTime` が付与）。
+
    **注意**: パスはスクリプトと同じディレクトリを基準とした相対パスで指定されています。別の場所に配置したい場合は、絶対パスで指定することも可能です。
 
-3. **インストール（Windowsサービス優先 → 失敗時はタスクスケジューラにフォールバック）**
+3. **インストール（リアルタイム常駐タスク優先 → 失敗時は5分バッチにフォールバック）**
    ```powershell
    .\Install-Watcher.ps1
    ```
 
    **動作の優先順位**:
-   - **Windowsサービス**（推奨）: フォルダ監視によるリアルタイム自動実行
-   - **タスクスケジューラ**（フォールバック）: 5分ごとのチェック実行
+   - **タスクスケジューラ（リアルタイム常駐）**（推奨）: ログオン時に起動し、継続的にフォルダ監視
+   - **タスクスケジューラ（5分バッチ）**（フォールバック）: 5分ごとのチェック実行
+   - **Windowsサービス**（任意/互換）: 環境に応じて利用可能
 
 ### 使用方法（自動監視）
 
 - **基本操作**: `unprocessed`フォルダにExcelファイルを配置するだけ（リアルタイム自動変換）
-- **Windowsサービス管理**（推奨）:
+- **リアルタイム常駐タスクの管理（推奨）**:
   ```powershell
-  # サービスの状態確認/開始/停止
-  Get-Service -Name "ExcelToPdfWatcher"
-  Start-Service -Name "ExcelToPdfWatcher"
-  Stop-Service -Name "ExcelToPdfWatcher"
+  # 状態確認/開始/停止（タスク名: ExcelToPdfWatcher-RealTime）
+  Get-ScheduledTask -TaskName "ExcelToPdfWatcher-RealTime"
+  Start-ScheduledTask -TaskName "ExcelToPdfWatcher-RealTime"
+  Stop-ScheduledTask -TaskName "ExcelToPdfWatcher-RealTime"
+
+  # 再起動ヘルパー
+  .\Run-Watcher.ps1  # 既定のタスク名を再起動
+  .\Run-Watcher.ps1 -TaskName "CustomTaskName"  # 任意指定
   ```
 
-- **タスクスケジューラ管理**（フォールバック時）:
+- **5分バッチ監視タスクの管理（フォールバック時）**:
   ```powershell
-  # タスクの状態確認（5分ごとの実行）
-  schtasks /Query /TN "ExcelToPdfWatcher" /V /FO LIST | Out-String
+  # タスクの状態確認
+  Get-ScheduledTask -TaskName "ExcelToPdfWatcher"
+  # 実行履歴/詳細はタスクスケジューラGUIかイベントログを参照
   ```
 
 - **ログ確認**:
   ```powershell
-  # 監視ログの確認
+  # 監視ログ
   Get-Content .\logs\watcher-$(Get-Date -Format 'yyyy-MM-dd').log -Tail 100
-  
-  # 変換処理ログの確認
+
+  # 変換処理ログ
   Get-Content .\logs\$(Get-Date -Format 'yyyy-MM-dd').log -Tail 100
+
+  # インストール/アンインストールログ
+  Get-Content .\logs\install-$(Get-Date -Format 'yyyy-MM-dd').log -Tail 100
+  Get-Content .\logs\uninstall-$(Get-Date -Format 'yyyy-MM-dd').log -Tail 100
   ```
 
 ### アンインストール（サービスとタスクの両方をクリーンに削除）
@@ -220,12 +241,16 @@ excel-to-pdf-by-acrobat/
         2. `config.json`のパス設定を確認する
         3. `.\Uninstall-Watcher.ps1`でアンインストール後、`.\Install-Watcher.ps1`で再インストールする
         4. `logs`フォルダ内の`watcher-*.log`ファイルでエラー詳細を確認する
-        5. サービスが停止でも、タスクスケジューラ（5分ごと）が稼働していれば監視は有効です（`schtasks /Query /TN "ExcelToPdfWatcher"`）。
+        5. リアルタイムタスクが停止でも、5分バッチが稼働していれば監視は継続します（`Get-ScheduledTask -TaskName "ExcelToPdfWatcher"`）。
 
   * **サービスが起動しない（Adobe Acrobat COM エラー）**
 
       * **原因**: Adobe AcrobatのCOMオブジェクトがSYSTEMアカウントで実行できない場合があります。
-      * **対策**: 本プロジェクトは自動でタスクスケジューラ（5分ごと）にフォールバックします。サービスアカウントを現在のユーザーに設定することで、COMエラーを回避できます。
+      * **対策**: 本プロジェクトは自動でタスクスケジューラ（リアルタイム→5分バッチ）にフォールバックします。サービス運用時はアカウントを現在のユーザーに設定すると回避できる場合があります。
+  * **ファイルが追加された直後に変換されない/失敗する**
+
+      * **原因**: ネットワーク経由や大容量で書き込みが長引く場合、ロック解除前に処理すると失敗します。
+      * **対策**: 自動で最大30秒待機します。頻発する場合は書き込み完了後に配置する運用に見直してください。
 
   * **ファイルを追加しても自動変換されない**
 
@@ -240,17 +265,19 @@ excel-to-pdf-by-acrobat/
 ```mermaid
 flowchart TD
     U[ユーザーがExcel配置\nunprocessed] -->|Created/Changed/Renamed| W(WatchFolder.ps1)
-    W -->|リアルタイム検知| C[Convert-ExcelToPdf.ps1]
+    W -->|リアルタイム/初期スキャン| C[Convert-ExcelToPdf.ps1]
     C -->|成功| P[completed/pdf]
     C -->|成功| E[completed/excel]
     C -->|失敗| F[failed]
 
     subgraph 実行形態
-        Svc[Windowsサービス<br/>フォルダ監視] -.->|失敗時自動切替| Task[タスクスケジューラ<br/>5分ごとチェック]
+        RT[タスクスケジューラ<br/>リアルタイム常駐] -.->|失敗時自動切替| Batch[タスクスケジューラ<br/>5分バッチ]
+        Svc[Windowsサービス<br/>（任意/互換）]
     end
 
+    RT -.->|継続監視| W
+    Batch -.->|定期実行| W
     Svc -.->|継続監視| W
-    Task -.->|定期実行| W
 
     subgraph エラー対策
         COM[COMエラー対策<br/>既存プロセス終了<br/>リトライ機能]
